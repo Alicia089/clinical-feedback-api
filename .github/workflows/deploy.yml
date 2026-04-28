@@ -1,0 +1,121 @@
+# .github/workflows/deploy.yml
+#
+# CI/CD Pipeline: Test → Build → Push to ECR → Deploy to App Runner
+#
+# Triggers: push to main branch
+#
+# Required GitHub Secrets:
+#   AWS_ACCESS_KEY_ID        — IAM user with ECR push + App Runner deploy permissions
+#   AWS_SECRET_ACCESS_KEY
+#   AWS_REGION               — e.g., us-east-1
+#   ECR_REPOSITORY           — e.g., clinical-feedback-api
+#   APP_RUNNER_SERVICE_ARN   — ARN of the App Runner service to update
+#
+# Engineering decision: AWS App Runner over ECS Fargate for initial deployment
+#   WHY: App Runner abstracts away load balancer config, VPC setup, and task
+#   definition management. For a single-service API at early scale, the ops
+#   overhead savings outweigh the reduced control. ECS Fargate is the upgrade
+#   path when multi-service orchestration or custom networking is needed.
+
+name: CI/CD — Clinical Feedback API
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+
+jobs:
+  # ── Job 1: Test ─────────────────────────────────────────────────────────────
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pytest
+        run: pytest tests/ -v --tb=short
+
+  # ── Job 2: Build & Push to ECR ──────────────────────────────────────────────
+  build-and-push:
+    name: Build Docker Image & Push to ECR
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    outputs:
+      image-uri: ${{ steps.build-push.outputs.image-uri }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to ECR
+        id: build-push
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker build -t "$IMAGE_URI" .
+          docker tag "$IMAGE_URI" "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          docker push "$IMAGE_URI"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          echo "image-uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+  # ── Job 3: Deploy to App Runner ─────────────────────────────────────────────
+  deploy:
+    name: Deploy to AWS App Runner
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to App Runner
+        run: |
+          aws apprunner start-deployment \
+            --service-arn ${{ secrets.APP_RUNNER_SERVICE_ARN }}
+
+      - name: Notify deployment complete
+        run: |
+          echo "Deployed image: ${{ needs.build-and-push.outputs.image-uri }}"
+          echo "Deployment triggered at $(date -u)"
